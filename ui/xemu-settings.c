@@ -190,7 +190,7 @@ const char *xemu_settings_get_path(void)
 		return settings_path;
 	}
 
-	char *base = SDL_GetBasePath();
+	char *base = SDL_GetBasePath(void);
 	assert(base != NULL);
 	size_t base_len = strlen(base);
 
