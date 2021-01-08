@@ -467,6 +467,8 @@
 #   define NV_PGRAPH_SETUPRASTER_POFFSETPOINTENABLE             (1 << 6)
 #   define NV_PGRAPH_SETUPRASTER_POFFSETLINEENABLE              (1 << 7)
 #   define NV_PGRAPH_SETUPRASTER_POFFSETFILLENABLE              (1 << 8)
+#   define NV_PGRAPH_SETUPRASTER_LINESMOOTHENABLE               (1 << 10)
+#   define NV_PGRAPH_SETUPRASTER_POLYSMOOTHENABLE               (1 << 11)
 #   define NV_PGRAPH_SETUPRASTER_CULLCTRL                       0x00600000
 #       define NV_PGRAPH_SETUPRASTER_CULLCTRL_FRONT                 1
 #       define NV_PGRAPH_SETUPRASTER_CULLCTRL_BACK                  2
@@ -515,6 +517,9 @@
 #define NV_PGRAPH_TEXCTL2_1                              0x000019F0
 #define NV_PGRAPH_TEXFILTER0                             0x000019F4
 #   define NV_PGRAPH_TEXFILTER0_MIPMAP_LOD_BIAS                 0x00001FFF
+#   define NV_PGRAPH_TEXFILTER0_CONVOLUTION_KERNEL              0x0000E000
+#       define NV_PGRAPH_TEXFILTER0_CONVOLUTION_KERNEL_QUINCUNX     1
+#       define NV_PGRAPH_TEXFILTER0_CONVOLUTION_KERNEL_GAUSSIAN_3   2
 #   define NV_PGRAPH_TEXFILTER0_MIN                             0x003F0000
 #       define NV_PGRAPH_TEXFILTER0_MIN_BOX_LOD0                    1
 #       define NV_PGRAPH_TEXFILTER0_MIN_TENT_LOD0                   2
@@ -603,6 +608,7 @@
 #   define NV_PCRTC_INTR_EN_0_VBLANK                            (1 << 0)
 #define NV_PCRTC_START                                   0x00000800
 #define NV_PCRTC_CONFIG                                  0x00000804
+#define NV_PCRTC_RASTER                                  0x00000808
 
 
 #define NV_PVIDEO_INTR                                   0x00000100
@@ -851,6 +857,8 @@
 #   define NV097_SET_DEPTH_TEST_ENABLE                        0x0000030C
 #   define NV097_SET_DITHER_ENABLE                            0x00000310
 #   define NV097_SET_LIGHTING_ENABLE                          0x00000314
+#   define NV097_SET_LINE_SMOOTH_ENABLE                       0x00000320
+#   define NV097_SET_POLY_SMOOTH_ENABLE                       0x00000324
 #   define NV097_SET_SKIN_MODE                                0x00000328
 #       define NV097_SET_SKIN_MODE_OFF                            0
 #       define NV097_SET_SKIN_MODE_2G                             1
@@ -1087,6 +1095,7 @@
 #           define NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R8B8           0x29
 # define NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_DEPTH_X8_Y24_FIXED 0x2E
 #           define NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_DEPTH_Y16_FIXED 0x30
+#           define NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_DEPTH_Y16_FLOAT 0x31
 #           define NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_Y16      0x35
 #           define NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8B8G8R8       0x3A
 #           define NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R8G8B8A8       0x3C
@@ -1146,6 +1155,7 @@
 #   define NV097_SET_COMBINER_CONTROL                         0x00001E60
 #   define NV097_SET_SHADOW_ZSLOPE_THRESHOLD                  0x00001E68
 #   define NV097_SET_SHADER_STAGE_PROGRAM                     0x00001E70
+#   define NV097_SET_DOT_RGBMAPPING                           0X00001E74
 #   define NV097_SET_SHADER_OTHER_STAGE_INPUT                 0x00001E78
 #   define NV097_SET_TRANSFORM_EXECUTION_MODE                 0x00001E94
 #       define NV097_SET_TRANSFORM_EXECUTION_MODE_MODE            0x00000003

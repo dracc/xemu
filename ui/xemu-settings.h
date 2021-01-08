@@ -36,6 +36,7 @@ enum xemu_settings_keys {
 	XEMU_SETTINGS_SYSTEM_DVD_PATH,
 	XEMU_SETTINGS_SYSTEM_MEMORY,
 	XEMU_SETTINGS_SYSTEM_SHORTANIM,
+	XEMU_SETTINGS_AUDIO_USE_DSP,
 	XEMU_SETTINGS_DISPLAY_SCALE,
 	XEMU_SETTINGS_DISPLAY_UI_SCALE,
 	XEMU_SETTINGS_INPUT_CONTROLLER_1_GUID,
@@ -72,6 +73,9 @@ int xemu_settings_did_fail_to_load(void);
 
 // Get path of the config file on disk
 const char *xemu_settings_get_path(void);
+
+// Get path of the default generated eeprom file on disk
+const char *xemu_settings_get_default_eeprom_path(void);
 
 // Load config file from disk, or load defaults
 void xemu_settings_load(void);

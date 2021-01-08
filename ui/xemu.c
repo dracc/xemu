@@ -31,7 +31,12 @@
 #include "qemu/module.h"
 #include "qemu/thread.h"
 #include "qemu/main-loop.h"
+#include "qemu/rcu.h"
 #include "qemu-version.h"
+#include "qemu-common.h"
+#include "qapi/error.h"
+#include "qapi/qapi-commands-block.h"
+#include "qapi/qmp/qdict.h"
 #include "ui/console.h"
 #include "ui/input.h"
 #include "ui/xemu-display.h"
@@ -41,13 +46,20 @@
 #include "xemu-input.h"
 #include "xemu-settings.h"
 #include "xemu-shaders.h"
-#include "hw/xbox/nv2a/gl/gloffscreen.h" // FIXME
+#include "xemu-version.h"
 
-#include "qemu-common.h"
-#include "qapi/error.h"
-#include "qapi/qapi-commands-block.h"
-#include "qapi/qmp/qdict.h"
 #include "hw/xbox/smbus.h" // For eject, drive tray
+#include "hw/xbox/nv2a/nv2a.h"
+
+#ifdef _WIN32
+// Provide hint to prefer high-performance graphics for hybrid systems
+// https://gpuopen.com/learn/amdpowerxpressrequesthighperformance/
+__declspec(dllexport) DWORD AmdPowerXpressRequestHighPerformance = 1;
+// https://docs.nvidia.com/gameworks/content/technologies/desktop/optimus.htm
+__declspec(dllexport) DWORD NvOptimusEnablement = 1;
+#endif
+
+void tcg_register_init_ctx(void); // tcg.c
 
 // #define DEBUG_XEMU_C
 
@@ -61,8 +73,6 @@ void xb_surface_gl_create_texture(DisplaySurface *surface);
 void xb_surface_gl_update_texture(DisplaySurface *surface, int x, int y, int w, int h);
 void xb_surface_gl_destroy_texture(DisplaySurface *surface);
 
-static void pre_swap(void);
-static void post_swap(void);
 static void sleep_ns(int64_t ns);
 
 static int sdl2_num_outputs;
@@ -346,9 +356,10 @@ static void sdl_send_mouse_event(struct sdl2_console *scon, int dx, int dy,
     qemu_input_event_sync();
 }
 
-static void toggle_full_screen(struct sdl2_console *scon)
+static void set_full_screen(struct sdl2_console *scon, bool set)
 {
-    gui_fullscreen = !gui_fullscreen;
+    gui_fullscreen = set;
+
     if (gui_fullscreen) {
         SDL_SetWindowFullscreen(scon->real_window,
                                 SDL_WINDOW_FULLSCREEN_DESKTOP);
@@ -366,6 +377,11 @@ static void toggle_full_screen(struct sdl2_console *scon)
 #if 0
     sdl2_redraw(scon);
 #endif
+}
+
+static void toggle_full_screen(struct sdl2_console *scon)
+{
+    set_full_screen(scon, !gui_fullscreen);
 }
 
 static int get_mod_state(void)
@@ -620,12 +636,12 @@ void sdl2_poll_events(struct sdl2_console *scon)
         sdl_update_caption(scon);
     }
 
+    int kbd = 0, mouse = 0;
+    xemu_hud_should_capture_kbd_mouse(&kbd, &mouse);
+
     while (SDL_PollEvent(ev)) {
-        int kbd = 0, mouse = 0;
         xemu_input_process_sdl_events(ev);
         xemu_hud_process_sdl_events(ev);
-        xemu_input_update_controllers();
-        xemu_hud_should_capture_kbd_mouse(&kbd, &mouse);
 
         switch (ev->type) {
         case SDL_KEYDOWN:
@@ -669,6 +685,8 @@ void sdl2_poll_events(struct sdl2_console *scon)
             break;
         }
     }
+
+    xemu_input_update_controllers();
 
     scon->idle_counter = 0;
     scon->dcl.update_interval = 16; // Ignored
@@ -800,20 +818,23 @@ static void sdl2_display_very_early_init(DisplayOptions *o)
         SDL_GL_CONTEXT_PROFILE_MASK,
         SDL_GL_CONTEXT_PROFILE_CORE);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-    SDL_GL_SetSwapInterval(0);
+
+    char *title = g_strdup_printf("xemu | v%s"
+#if XEMU_DEBUG_BUILD
+                                  " Debug"
+#endif
+                                  , xemu_version);
 
     // Create main window
     m_window = SDL_CreateWindow(
-        "xemu",
-        SDL_WINDOWPOS_CENTERED,
-        SDL_WINDOWPOS_CENTERED,
-        1024, 768,
+        title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1024, 768,
         SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
     if (m_window == NULL) {
         fprintf(stderr, "Failed to create main window\n");
         SDL_Quit();
         exit(1);
     }
+    g_free(title);
 
     m_context = SDL_GL_CreateContext(m_window);
     assert(m_context != NULL);
@@ -838,7 +859,7 @@ static void sdl2_display_very_early_init(DisplayOptions *o)
     }
 
     // Initialize offscreen rendering context now
-    glo_context_create();
+    nv2a_gl_context_init();
     SDL_GL_MakeCurrent(NULL, NULL);
 
     // FIXME: atexit(sdl_cleanup);
@@ -850,6 +871,7 @@ static void sdl2_display_early_init(DisplayOptions *o)
     display_opengl = 1;
 
     SDL_GL_MakeCurrent(m_window, m_context);
+    SDL_GL_SetSwapInterval(0);
     xemu_hud_init(m_window, m_context);
     blit = create_decal_shader(SHADER_TYPE_BLIT);
 }
@@ -915,10 +937,8 @@ static void sdl2_display_init(DisplayState *ds, DisplayOptions *o)
 #endif
     }
 
-    gui_grab = 0;
-    if (gui_fullscreen) {
-        sdl_grab_start(0);
-    }
+    sdl2_console[0].real_window = m_window;
+    sdl2_console[0].winctx = m_context;
 
     mouse_mode_notifier.notify = sdl_mouse_mode_change;
     qemu_add_mouse_mode_change_notifier(&mouse_mode_notifier);
@@ -1029,88 +1049,13 @@ static void sdl2_set_scanout_mode(struct sdl2_console *scon, bool scanout)
 }
 #endif
 
-static void xemu_sdl2_gl_render_surface(struct sdl2_console *scon)
-{
-    int ww, wh;
-
-    SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
-    // sdl2_set_scanout_mode(scon, false);
-    SDL_GL_GetDrawableSize(scon->real_window, &ww, &wh);
-
-    // Get texture dimensions
-    int tw, th;
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, scon->surface->texture);
-    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &tw);
-    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &th);
-
-    // Calculate scaling factors
-    float scale[2];
-
-    if (scaling_mode == DISPLAY_SCALE_STRETCH) {
-        // Stretch to fit
-        scale[0] = 1.0;
-        scale[1] = 1.0;
-    } else if (scaling_mode == DISPLAY_SCALE_CENTER) {
-        // Centered
-        scale[0] = (float)tw/(float)ww;
-        scale[1] = (float)th/(float)wh;
-    } else {
-        // Scale to fit
-        float t_ratio = (float)tw/(float)th;
-        float w_ratio = (float)ww/(float)wh;
-        if (w_ratio >= t_ratio) {
-            scale[0] = t_ratio/w_ratio;
-            scale[1] = 1.0;
-        } else {
-            scale[0] = 1.0;
-            scale[1] = w_ratio/t_ratio;
-        }
-    }
-
-    struct decal_shader *s = blit;
-    s->flip = 1;
-
-    glViewport(0, 0, ww, wh);
-    glUseProgram(s->prog);
-    glBindVertexArray(s->vao);
-    glUniform1i(s->FlipY_loc, s->flip);
-    glUniform4f(s->ScaleOffset_loc, scale[0], scale[1], 0, 0);
-    glUniform4f(s->TexScaleOffset_loc, 1.0, 1.0, 0, 0);
-    glUniform1i(s->tex_loc, 0);
-
-    glClearColor(0, 0, 0, 0);
-    glClear(GL_COLOR_BUFFER_BIT);
-    glDrawElements(GL_TRIANGLE_FAN, 4, GL_UNSIGNED_INT, NULL);
-
-    // FIXME: Finer locking
-    qemu_mutex_lock_main_loop();
-    qemu_mutex_lock_iothread();
-    xemu_hud_render();
-    qemu_mutex_unlock_iothread();
-    qemu_mutex_unlock_main_loop();
-
-    // xb_surface_gl_render_texture(scon->surface);
-    pre_swap();
-    SDL_GL_SwapWindow(scon->real_window);
-    post_swap();
-}
-
 void sdl2_gl_update(DisplayChangeListener *dcl,
                     int x, int y, int w, int h)
 {
     struct sdl2_console *scon = container_of(dcl, struct sdl2_console, dcl);
     assert(scon->opengl);
-#if 1
+
     SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
-    if (scon->surface) {
-        // glDeleteTextures(1, &scon->surface->texture);
-        xb_surface_gl_destroy_texture(scon->surface);
-        // assert(glGetError() == GL_NO_ERROR);
-    }
-    xb_surface_gl_create_texture(scon->surface);
-#endif
-    scon->updates++;
 }
 
 void sdl2_gl_switch(DisplayChangeListener *dcl,
@@ -1122,7 +1067,6 @@ void sdl2_gl_switch(DisplayChangeListener *dcl,
     assert(scon->opengl);
 
     SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
-    xb_surface_gl_destroy_texture(scon->surface);
 
     scon->surface = new_surface;
 
@@ -1145,8 +1089,6 @@ void sdl2_gl_switch(DisplayChangeListener *dcl,
                 (surface_height(old_surface) != surface_height(new_surface)))) {
         // sdl2_window_resize(scon);
     }
-
-    xb_surface_gl_create_texture(scon->surface);
 }
 
 float fps = 1.0;
@@ -1168,22 +1110,149 @@ void sdl2_gl_refresh(DisplayChangeListener *dcl)
 {
     struct sdl2_console *scon = container_of(dcl, struct sdl2_console, dcl);
     assert(scon->opengl);
+    bool flip_required = false;
 
     update_fps();
 
-    SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
+    /* XXX: Note that this bypasses the usual VGA path in order to quickly
+     * get the surface. This is simple and fast, at the cost of accuracy.
+     * Ideally, this should go through the VGA code and opportunistically pull
+     * the surface like this, but handle the VGA logic as well. For now, just
+     * use this fast path to handle the common case.
+     *
+     * In the event the surface is not found in the surface cache, e.g. when
+     * the guest code isn't using HW accelerated rendering, but just blitting
+     * to the framebuffer, fall back to the VGA path.
+     */
+    GLuint tex = nv2a_get_framebuffer_surface();
+    if (tex == 0) {
+        if (scon->surface) {
+            xb_surface_gl_destroy_texture(scon->surface);
+        }
+        xb_surface_gl_create_texture(scon->surface);
+        scon->updates++;
+        tex = scon->surface->texture;
+        flip_required = true;
+    }
 
+    /* FIXME: Finer locking. Event handlers in segments of the code expect
+     * to be running on the main thread with the BQL. For now, acquire the
+     * lock and perform rendering, but release before swap to avoid
+     * possible lengthy blocking (for vsync).
+     */
     qemu_mutex_lock_main_loop();
     qemu_mutex_lock_iothread();
-    graphic_hw_update(dcl->con);
+    sdl2_poll_events(scon);
 
+    SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex);
+
+    // Get texture dimensions
+    int tw, th;
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &tw);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &th);
+
+    // Get window dimensions
+    int ww, wh;
+    SDL_GL_GetDrawableSize(scon->real_window, &ww, &wh);
+
+    // Calculate scaling factors
+    float scale[2];
+    if (scaling_mode == DISPLAY_SCALE_STRETCH) {
+        // Stretch to fit
+        scale[0] = 1.0;
+        scale[1] = 1.0;
+    } else if (scaling_mode == DISPLAY_SCALE_CENTER) {
+        // Centered
+        scale[0] = (float)tw/(float)ww;
+        scale[1] = (float)th/(float)wh;
+    } else {
+        // Scale to fit
+        float t_ratio = (float)tw/(float)th;
+        float w_ratio = (float)ww/(float)wh;
+        if (w_ratio >= t_ratio) {
+            scale[0] = t_ratio/w_ratio;
+            scale[1] = 1.0;
+        } else {
+            scale[0] = 1.0;
+            scale[1] = w_ratio/t_ratio;
+        }
+    }
+
+    // Render framebuffer and GUI
+    struct decal_shader *s = blit;
+    s->flip = flip_required;
+    glViewport(0, 0, ww, wh);
+    glUseProgram(s->prog);
+    glBindVertexArray(s->vao);
+    glUniform1i(s->FlipY_loc, s->flip);
+    glUniform4f(s->ScaleOffset_loc, scale[0], scale[1], 0, 0);
+    glUniform4f(s->TexScaleOffset_loc, 1.0, 1.0, 0, 0);
+    glUniform1i(s->tex_loc, 0);
+    glClearColor(0, 0, 0, 0);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDrawElements(GL_TRIANGLE_FAN, 4, GL_UNSIGNED_INT, NULL);
+    xemu_hud_render();
+
+    // GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    // int result = glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, (GLuint64)(5000000000));
+    // assert(result == GL_CONDITION_SATISFIED || result == GL_ALREADY_SIGNALED);
+    // glDeleteSync(fence);
+
+    // Release BQL before swapping (which may sleep if swap interval is not immediate)
+    qemu_mutex_unlock_iothread();
+    qemu_mutex_unlock_main_loop();
+
+    SDL_GL_SwapWindow(scon->real_window);
+
+    /* VGA update (see note above) + vblank */
+    qemu_mutex_lock_main_loop();
+    qemu_mutex_lock_iothread();
+    graphic_hw_update(scon->dcl.con);
     if (scon->updates && scon->surface) {
         scon->updates = 0;
     }
-    sdl2_poll_events(scon);
     qemu_mutex_unlock_iothread();
     qemu_mutex_unlock_main_loop();
-    xemu_sdl2_gl_render_surface(scon);
+
+    /*
+     * Throttle to make sure swaps happen at 60Hz
+     */
+    static int64_t last_update = 0;
+    int64_t deadline = last_update + 16666666;
+
+    int64_t sleep_acc = 0;
+    int64_t spin_acc = 0;
+
+#ifndef _WIN32
+    const int64_t sleep_threshold = 2000000;
+#else
+    const int64_t sleep_threshold = 250000;
+#endif
+
+    while (1) {
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        int64_t time_remaining = deadline - now;
+        if (now < deadline) {
+            if (time_remaining > sleep_threshold) {
+                // Try to sleep until the until reaching the sleep threshold.
+                sleep_ns(time_remaining - sleep_threshold);
+                sleep_acc += qemu_clock_get_ns(QEMU_CLOCK_REALTIME)-now;
+            } else {
+                // Simply spin to avoid extra delays incurred with swapping to
+                // another process and back in the event of being within
+                // threshold to desired event.
+                spin_acc++;
+            }
+        } else {
+            DPRINTF("zzZz %g %ld\n", (double)sleep_acc/1000000.0, spin_acc);
+            last_update = now;
+            break;
+        }
+    }
+
 }
 
 void sdl2_gl_redraw(struct sdl2_console *scon)
@@ -1208,7 +1277,7 @@ QEMUGLContext sdl2_gl_create_context(DisplayChangeListener *dcl,
     SDL_GLContext ctx;
 
     assert(0);
-    
+
     assert(scon->opengl);
 
     SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
@@ -1286,7 +1355,7 @@ void sdl2_gl_scanout_texture(DisplayChangeListener *dcl,
                              uint32_t w, uint32_t h)
 {
     assert(0);
-#if 0 
+#if 0
     struct sdl2_console *scon = container_of(dcl, struct sdl2_console, dcl);
 
     assert(scon->opengl);
@@ -1374,10 +1443,6 @@ static void *call_qemu_main(void *opaque)
     exit(status);
 }
 
-static void pre_swap(void)
-{
-}
-
 /* Note: only supports millisecond resolution on Windows */
 static void sleep_ns(int64_t ns)
 {
@@ -1389,42 +1454,6 @@ static void sleep_ns(int64_t ns)
 #else
         Sleep(ns / SCALE_MS);
 #endif
-}
-
-static void post_swap(void)
-{
-    // Throttle to make sure swaps happen at 60Hz
-    static int64_t last_update = 0;
-    int64_t deadline = last_update + 16666666;
-    int64_t sleep_acc = 0;
-    int64_t spin_acc = 0;
-
-#ifndef _WIN32
-    const int64_t sleep_threshold = 2000000;
-#else
-    const int64_t sleep_threshold = 250000;
-#endif
-
-    while (1) {
-        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-        int64_t time_remaining = deadline - now;
-        if (now < deadline) {
-            if (time_remaining > sleep_threshold) {
-                // Try to sleep until the until reaching the sleep threshold.
-                sleep_ns(time_remaining - sleep_threshold);
-                sleep_acc += qemu_clock_get_ns(QEMU_CLOCK_REALTIME)-now;
-            } else {
-                // Simply spin to avoid extra delays incurred with swapping to
-                // another process and back in the event of being within
-                // threshold to desired event.
-                spin_acc++;
-            }
-        } else {
-            DPRINTF("zzZz %g %ld\n", (double)sleep_acc/1000000.0, spin_acc);
-            last_update = now;
-            break;
-        }
-    }
 }
 
 int main(int argc, char **argv)
@@ -1444,11 +1473,26 @@ int main(int argc, char **argv)
     DPRINTF("Main thread: waiting for display_init_sem\n");
     qemu_sem_wait(&display_init_sem);
 
+    gui_grab = 0;
+    if (gui_fullscreen) {
+        sdl_grab_start(0);
+        set_full_screen(&sdl2_console[0], gui_fullscreen);
+    }
+
+    /*
+     * FIXME: May want to create a callback mechanism for main QEMU thread
+     * to just run functions to avoid TLS bugs and locking issues.
+     */
+    tcg_register_init_ctx();
+    // rcu_register_thread();
+
     DPRINTF("Main thread: initializing app\n");
 
     while (1) {
         sdl2_gl_refresh(&sdl2_console[0].dcl);
     }
+
+    // rcu_unregister_thread();
 }
 
 void xemu_eject_disc(void)
